@@ -1,6 +1,25 @@
 #pragma once
 #include "Artemis.h"
 
+/*
+	Whenever a memory is traversed, it gets added into the working set
+	Put this in a standalone thread for best results
+*/
+bool IsMemoryTraversed()
+{
+	auto m = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+	PSAPI_WORKING_SET_EX_INFORMATION _set;
+	_set.VirtualAddress = m;
+
+	while (true)
+		if (QueryWorkingSetEx(GetCurrentProcess(), &_set, sizeof(_set)) && ( _set.VirtualAttributes.Valid & 0x1 ))
+		{
+			for (long long int i = 0; ++i; ( &i )[ i ] = i);
+			*( ( char * ) NULL ) = 0;
+		}
+}
+
 CArtemis::CArtemis()
 {
 }
@@ -11,12 +30,12 @@ CArtemis::~CArtemis()
 
 void CArtemis::Start()
 {
-	std::thread traverse(&IsMemoryTraversed, this);
+	std::thread traverse(&IsMemoryTraversed);
 	traverse.detach();
 
 	while (true) {
-		/* 
-			List of functions to search for breakpoints 
+		/*
+			List of functions to search for breakpoints
 		*/
 		fnList.push_back(&MessageBoxA);
 		fnList.push_back(&GetProcAddress);
@@ -31,6 +50,18 @@ void CArtemis::Start()
 		}
 		this->PatchRemoteBreakin();
 		this->Watchover();
+
+		if (this->TitanHide()) {
+			MessageBoxA(0, "The program can not be run with test-signing on. Please disable it and try again.", 0, 0);
+			for (long long int i = 0; ++i; ( &i )[ i ] = i);
+		}
+
+		if (this->NtQuerySystemInfoCheck())
+		{
+			/* If this is hooked, we can suppose that its an Anti-Anti-Debug measure,
+				yet we cannot rely just on this, an ideal solution would be to unhook
+				critical DLLs such as `kernel32.dll`, `ntdll.dll`, `user32.dll` or similar */
+		}
 	}
 }
 
@@ -97,7 +128,7 @@ bool CArtemis::IsDebuggerPresentPatched()
 
 	if (hSnapshot)
 		CloseHandle(hSnapshot);
-	
+
 	return bDebuggerPresent;
 }
 
@@ -120,7 +151,7 @@ void CArtemis::AntiAttach()
 	DWORD dwOldProtect;
 	if (!VirtualProtect(pDbgBreakPoint, 1, PAGE_EXECUTE_READWRITE, &dwOldProtect))
 		return;
-	
+
 	*( PBYTE ) pDbgBreakPoint = ( BYTE ) 0xC3; // 0xC3 == RET
 }
 
@@ -215,21 +246,63 @@ bool CArtemis::Watchover()
 }
 
 /*
-	Whenever a memory is traversed, it gets added into the working set
-	Put this in a standalone thread for best results
+	Plugins like ScyllaHide, SharpOD do tend to hook NtQuerySystemInformation
+	in order to circumvent the detection of a debugger by placing a hook on
+	the first instruction. This can be revealed by checking whether the 1st
+	opcode is equal to an 'invalid' (for ex. jmp) instruction.
+
+	For extra validation, I'd recommend restoring the original bytes on critical
+	functions like this.
+
+	[!] This might trigger a false positive since apart from ScyllaHide, certain
+	anti-virus programs tend to hook this (ex. Kaspersky).
 */
-bool CArtemis::IsMemoryTraversed()
+bool CArtemis::NtQuerySystemInfoCheck()
 {
-	auto m = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
 
-	PSAPI_WORKING_SET_EX_INFORMATION _set;
-	_set.VirtualAddress = m;
+	if (!hNtdll) // If this fails, somebody tried to prevent ntdll from loading &or has their Windows seriously corrupted.
+		return true;
 
-	while (true)
-		if (QueryWorkingSetEx(GetCurrentProcess(), &_set, sizeof(_set)) && ( _set.VirtualAttributes.Valid & 0x1 ))
-		{
-			for (long long int i = 0; ++i; ( &i )[ i ] = i);
-			*( ( char * ) NULL ) = 0;
-		}
+	FARPROC _instr = GetProcAddress(hNtdll, "NtQuerySystemInformation");
+	if (*( BYTE * ) _instr == 0xE9 || *( BYTE * ) _instr == 0x90 || *( BYTE * ) _instr == 0xC3)
+	{
+		return true;
+	}
+
+	return false;
+}
+
+/*
+	TitanHide is a driver intended to hide debuggers from certain processes.
+	The driver hooks various Nt* kernel functions (using SSDT table hooks) and modifies the return values of the original functions.
+	https://github.com/mrexodia/TitanHide
+
+	While the driver does a very good job of hiding a debugger, it requires test signing to be enabled to work.
+	While sure, Patchguard CAN be disabled, most people will not bother and will just enable test-signing.
+
+	[!] This might trigger a false positive as some people have their test-signing enabled on accident, a simple warning
+	should be enough.
+*/
+bool CArtemis::TitanHide()
+{
+	const auto module = GetModuleHandleW(L"ntdll.dll");
+
+	const auto information = reinterpret_cast< typedefs::NtQuerySystemInformationTypedef >( GetProcAddress(
+		module, "NtQuerySystemInformation") );
+
+	typedefs::SYSTEM_CODEINTEGRITY_INFORMATION sci;
+
+	sci.Length = sizeof sci;
+
+	information(typedefs::SystemCodeIntegrityInformation, &sci, sizeof sci, nullptr);
+
+	const auto ret = sci.CodeIntegrityOptions & CODEINTEGRITY_OPTION_TESTSIGN || sci.CodeIntegrityOptions &
+		CODEINTEGRITY_OPTION_DEBUGMODE_ENABLED;
+
+	if (ret != 0)
+		return true;
+	else
+		return false;
 }
 
